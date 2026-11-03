@@ -1,0 +1,7 @@
+tunnel: 2b6c95f2-e574-454b-96ba-5d2913afcdbb
+credentials-file: /etc/cloudflared/2b6c95f2-e574-454b-96ba-5d2913afcdbb.json
+
+ingress:
+  - hostname: venderos.my.id
+    service: http://127.0.0.1:8080
+  - service: http_status:404
